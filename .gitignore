@@ -1,0 +1,6 @@
+/*
+!/robot_control/
+!/robot_interfaces/
+!/.gitignore
+**/__pycache__/
+**/*.pyc
