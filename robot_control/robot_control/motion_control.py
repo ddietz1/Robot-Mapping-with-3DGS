@@ -33,24 +33,35 @@ class MoveJoints(HelloNode):
             wait_for_first_pointcloud=False
         )
 
-        # Startup the bot
-        # robot = Robot()
-        # robot.startup()
-        # robot.home()
+        # Declare Parameters
+        if not self.has_parameter('stretch_waypoints'):
+            self.declare_parameter('stretch_waypoints', [0.0, 0.0])
+        if not self.has_parameter('d435_poses_pan'):
+            self.declare_parameter('d435_poses_pan', [0.0])
+        if not self.has_parameter('d435_poses_tilt'):
+            self.declare_parameter('d435_poses_tilt', [0.0])
+        if not self.has_parameter('d405_poses_tilt'):
+            self.declare_parameter('d405_poses_tilt', [0.0])
+        if not self.has_parameter('d405_poses_yaw'):
+            self.declare_parameter('d405_poses_yaw', [0.0])
+        if not self.has_parameter('d405_poses_lift'):
+            self.declare_parameter('d405_poses_lift', [0.4])
+
+        pans = self.get_parameter('d435_poses_pan').value
+        self.get_logger().info(f'd435 pans are {pans}')
+        tilts = self.get_parameter('d435_poses_tilt').value
+        self.d435_poses = list(zip(pans, tilts))  # -> [(pan, tilt), ...]
+
+        self.d405_tilts = self.get_parameter('d405_poses_tilt').value
+        self.d405_yaws = self.get_parameter('d405_poses_yaw').value
+        self.d405_lifts = self.get_parameter('d405_poses_lift').value
+
+        self.waypoints = [self.get_parameter('stretch_waypoints').value]
+        self.get_logger().info(f'waypoints are {self.waypoints}')
 
         # Declare Constants
-        self.mode = None
+        self.stretch_mode = None
         self.gripper_open = True
-        self.waypoints = [
-            [0.0, 0.0]
-        ]
-        self.d435_poses = [ # pan, tilt...
-            [0.0, 0.0],
-            [0.0, -0.5],
-            [0.5, -0.5],
-            [0.5, 0.0],
-            [0.0, 0.0]
-        ]
 
         # Variables for frame captures
         self.capture_dir = os.path.expanduser('~/stretch_user/captures')
@@ -58,8 +69,10 @@ class MoveJoints(HelloNode):
 
         self.bridge = CvBridge()
         self._capture_lock = threading.Lock()
-        self._capture_requested = False
-        self._captured_frame = None
+        self._d435_capture_requested = False
+        self._d435_captured_frame = None
+        self._d405_capture_requested = False
+        self._d405_captured_frame = None
 
         # Declare global vars
         self.navigator = BasicNavigator()
@@ -112,7 +125,7 @@ class MoveJoints(HelloNode):
 
         self.create_subscription(
             String,
-            '/stretch/mode',
+            '/mode',
             self.mode_cb,
             10
         )
@@ -121,40 +134,91 @@ class MoveJoints(HelloNode):
         rgb_sub = message_filters.Subscriber(
             self,
             Image,
-            '/gripper_camera/color/image_rect_raw'
+            '/camera/color/image_raw'
         )
 
         depth_sub = message_filters.Subscriber(
             self,
             Image,
-            '/gripper_camera/aligned_depth_to_color/image_raw'
+            '/camera/aligned_depth_to_color/image_raw'
         )
 
         info_sub = message_filters.Subscriber(
             self,
             CameraInfo,
-            '/gripper_camera/color/camera_info'
+            '/camera/aligned_depth_to_color/camera_info'
+        )
+
+        # RGB-D subscriptions for gripper camera
+
+        gripper_rgb_sub = message_filters.Subscriber(
+            self,
+            Image,
+            '/gripper_camera/color/image_rect_raw'
+        )
+
+        gripper_depth_sub = message_filters.Subscriber(
+            self,
+            Image,
+            '/gripper_camera/aligned_depth_to_color/image_raw'
+        )
+
+        gripper_info_sub = message_filters.Subscriber(
+            self,
+            CameraInfo,
+            '/gripper_camera/aligned_depth_to_color/camera_info'
         )
 
         self.ts = message_filters.ApproximateTimeSynchronizer(
             [rgb_sub, depth_sub, info_sub], queue_size=10, slop=0.5 # maybe adjust slop
         )
+
+        self.gripper_ts = message_filters.ApproximateTimeSynchronizer(
+            [gripper_rgb_sub, gripper_depth_sub, gripper_info_sub], queue_size=10, slop=0.5
+        )
         self.ts.registerCallback(self.synced_frame_cb)
+        self.gripper_ts.registerCallback(self.gripper_synced_frame_cb)
 
 
     # --- Client callbacks ---
-    def switch_mode(self, client, mode):
+    def switch_mode(self, client, mode, timeout_sec=2.0):
         """Calls the drivers mode change service."""
 
         # Check current mode
-        if self.mode == mode:
+        if self.stretch_mode == mode:
             return True
         if not client.wait_for_service(timeout_sec=3.0):
             self.get_logger().warn(f'Mode switch service not available')
             return False
 
         future = client.call_async(Trigger.Request())
-        self.get_logger().info(f'Switching to {mode} mode')
+
+        start = self.get_clock().now()
+        while not future.done():
+            time.sleep(0.05)
+            elapsed = (self.get_clock().now() - start).nanoseconds / 1e9
+            if elapsed > timeout_sec:
+                self.get_logger().warn(f'Mode switch service call timed out for {mode}')
+                return False
+            
+        result = future.result()
+        if result is None or not result.success:
+            self.get_logger().warn(f'Mode switch service reported failure for {mode}')
+            return False
+        
+        # The service call succeeding means the driver accepted the request,
+        # but self.mode only updates once /stretch/mode publishes the change.
+        # Wait for that so callers can trust self.mode immediately after this returns.
+        start = self.get_clock().now()
+        while self.stretch_mode != mode:
+            time.sleep(0.05)
+            elapsed = (self.get_clock().now() - start).nanoseconds / 1e9
+            if elapsed > timeout_sec:
+                self.get_logger().warn(
+                    f'Mode switch service succeeded but /stretch/mode never reported {mode}'
+                )
+                return False
+            self.get_logger().info(f'Switching to {mode} mode')
         return True
 
     # --- Service callbacks ---
@@ -174,24 +238,33 @@ class MoveJoints(HelloNode):
     def mode_cb(self, msg):
         """Checks the mode and updates internal mode."""
 
-        self.mode = msg.data
+        self.stretch_mode = msg.data
 
     def synced_frame_cb(self, rgb_msg, depth_msg, info_msg):
-        """Stores a camera frame when requested."""
+        """Stores a camera frame from the mounted d435 when requested."""
 
         with self._capture_lock:
-            if not self._capture_requested:
+            if not self._d435_capture_requested:
                 return
-            self._captured_frame = (rgb_msg, depth_msg, info_msg)
-            self._capture_requested = False
+            self._d435_captured_frame = (rgb_msg, depth_msg, info_msg)
+            self._d435_capture_requested = False
 
+    def gripper_synced_frame_cb(self, rgb_msg, depth_msg, info_msg):
+        """Stores a camera frame from the gripper d405 camera."""
+
+        with self._capture_lock:
+            if not self._d405_capture_requested:
+                return
+            
+            self._d405_captured_frame = (rgb_msg, depth_msg, info_msg)
+            self._d405_capture_requested = False
     # --- Helper functions ---
     def wait_until_settled(self, joint_names, vel_thresh=0.01, timeout_sec=2.0):
         """Block frame capture until joint vels fall below threshold."""
 
         start = self.get_clock().now()
         while True:
-            rclpy.spin_once(self, timeout_sec=0.05)
+            time.sleep(0.05)
             if self.joint_state is not None and self.joint_state.velocity:
                 idxs = [self.joint_state.name.index(j)
                         for j in joint_names if j in self.joint_state.name]
@@ -200,35 +273,40 @@ class MoveJoints(HelloNode):
                     return True
             elapsed = (self.get_clock().now() - start).nanoseconds / 1e9
             if elapsed > timeout_sec:
-                self.get_logger().warn('Settle timeout -- capturing anyway')
+                self.get_logger().warn('Settle timeout, capturing anyway')
                 return False
             
-    def capture_frame(self, pose_name, timeout_sec=3.0):
+    def capture_frame(self, pose_name, timeout_sec=3.0, camera='d435'):
         """Request and block until one frame is captured."""
 
+        assert hasattr(self, f'_{camera}_capture_requested')
+        assert hasattr(self, f'_{camera}_captured_frame')
+        flag_attr = f'_{camera}_capture_requested'
+        frame_attr = f'_{camera}_captured_frame'
+
         with self._capture_lock:
-            self._captured_frame = None
-            self._capture_requested = True
+            setattr(self, frame_attr, None)
+            setattr(self, flag_attr, True)
         start = self.get_clock().now()
         while True:
             with self._capture_lock:
-                frame = self._captured_frame
+                frame = getattr(self, frame_attr)
             if frame is not None:
                 break
-            rclpy.spin_once(self, timeout_sec=0.05)
+            time.sleep(0.05)
             elapsed = (self.get_clock().now() - start).nanoseconds / 1e9
             if elapsed > timeout_sec:
-                self.get_logger().warn(f'Capture timed out at {pose_name}')
+                self.get_logger().warn(f'Capture timed out at {pose_name} ({camera})')
                 with self._capture_lock:
-                    self._capture_requested = False
+                    setattr(self, flag_attr, False)
                 return None
  
         rgb_msg, depth_msg, info_msg = frame
         rgb_img = self.bridge.imgmsg_to_cv2(rgb_msg, desired_encoding='bgr8')
         depth_img = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding='passthrough')
  
-        rgb_path = os.path.join(self.capture_dir, f'{pose_name}_rgb.png')
-        depth_path = os.path.join(self.capture_dir, f'{pose_name}_depth.npy')
+        rgb_path = os.path.join(self.capture_dir, f'{pose_name}_{camera}_rgb.png')
+        depth_path = os.path.join(self.capture_dir, f'{pose_name}_{camera}_depth.npy')
         cv2.imwrite(rgb_path, rgb_img)
         np.save(depth_path, depth_img)
         self.get_logger().info(f'Saved capture: {rgb_path}, {depth_path}')
@@ -270,49 +348,88 @@ class MoveJoints(HelloNode):
                 self.camera_capture_pose(cp)
                 self.wait_until_settled(['joint_head_pan', 'joint_head_tilt'])
                 pose_name = f'wp{wp_idx}_d435_pose{idx}'
-                self.capture_frame(pose_name)
+                self.capture_frame(pose_name, camera='d435')
 
-                # capture 0.5 seconds of video feed
             self.get_logger().info('Completed d435 camera poses')
             # capture smaller images with the d405
 
-            # Send lift to 0.3
-            # TODO mess around with this to get the same patter with the d405
-            self.send_command(0.6, 'joint_lift')
-            time.sleep(0.5)
-            self.send_command(0.3, 'joint_lift')
-            time.sleep(0.5)
+            # Send lift to various positions
+            for idx, cp in enumerate(self.d405_lifts):
+                self.camera_capture_pose(cp, camera='d405', joint='joint_lift')
+                self.wait_until_settled(['joint_lift'])
+                pose_name = f'wp{wp_idx}_d405_pose{idx}'
+                self.capture_frame(pose_name, camera='d405')
+
+                # Within each lift position, yaw and pitch the gripper
+                for yaw_idx, yaw_pose in enumerate(self.d405_yaws):
+                    self.camera_capture_pose(yaw_pose, camera='d405', joint='joint_wrist_yaw')
+                    self.wait_until_settled((['joint_wrist_yaw']))
+                    pose_name = f'wp{wp_idx}_d405_pose{idx}_yaw_{yaw_idx}'
+                    self.capture_frame(pose_name, camera='d405')
+
+                    # Within each yaw, pitch the gripper 
+                    for p_idx, p_pose, in enumerate(self.d405_tilts):
+                        self.camera_capture_pose(p_pose, camera='d405', joint='joint_wrist_pitch')
+                        self.wait_until_settled((['joint_wrist_pitch']))
+                        pose_name = f'wp{wp_idx}_d405_pose{idx}_yaw_{yaw_idx}_pitch_{p_idx}'
+                        self.capture_frame(pose_name, camera='d405')
+
+            # self.send_command(0.6, 'joint_lift')
+            # self.wait_until_settled(['joint_lift'])
+            # pose_name = f'wp_d405_pose1'
+            # self.capture_frame(pose_name, camera='d405')
+            # self.send_command(0.3, 'joint_lift')
+            # pose_name = f'wp_d405_pose2'
+            # self.capture_frame(pose_name, camera='d405')
+            # self.send_command(0.3, 'joint_lift')
 
             # Send arm out and wrist tilt to 0.0
             # self.send_command(0.2, 'joint_arm_l1') # broken :(
-            self.send_command(0.0, 'joint_wrist_pitch')
+            # self.send_command(0.0, 'joint_wrist_pitch')
 
-    def camera_capture_pose(self, pose):
+    def camera_capture_pose(self, pose, camera='d435', joint='joint_lift'):
         """Move the camera on the bot to a given pose."""
 
         # grab tilt and pan from the list
-        pan = pose[0]
-        tilt = pose[1]
+        if camera=='d435':
+            pan = pose[0]
+            tilt = pose[1]
 
-        request = Camera.Request()
-        response = Camera.Response()
-        request.angles = [pan, tilt]
-        self.move_camera(request=request, response=response)
+            request = Camera.Request()
+            response = Camera.Response()
+            request.angles = [pan, tilt]
+        elif camera=='d405':
+            yaw = pose
+            extra = pose # TODO Adding this because the service requires a 2D array, should not affect anything
+            request = Camera.Request()
+            response = Camera.Response()
+            request.angles = [yaw, extra]
+        self.move_camera(request=request, response=response, camera=camera, joint=joint)
 
-    def move_camera(self, request, response):
+    def move_camera(self, request, response, camera='d435', joint='joint_lift'):
         """"Adjust the camera position."""
 
         # before moving joints, switch to position mode
-        self.switch_mode(self.pos_mode_client, 'position')
+        if self.stretch_mode != 'position':
+            self.switch_mode(self.pos_mode_client, 'position')
 
         joint_positions = [float(x) for x in request.angles]
         pan = joint_positions[0]
-        tilt = joint_positions[1]
-        self.move_to_pose(
-            {'joint_head_pan': pan, 'joint_head_tilt': tilt},
-            blocking=True
-        )
-        self.get_logger().info(f'Moving camera to {pan}, {tilt}')
+
+        if camera=='d435':
+            tilt = joint_positions[1]
+            self.move_to_pose(
+                {'joint_head_pan': pan, 'joint_head_tilt': tilt},
+                blocking=True
+            )
+            self.get_logger().info(f'Moving camera to {pan}, {tilt}')
+
+        elif camera=='d405':
+            self.move_to_pose(
+                {joint: pan},
+                blocking=True
+            )
+            self.get_logger().info(f'Moving gripper camera joint: {joint} to {pan}')
         return response
 
     def drive_robot(self, speed=0.1, duration=2.0):
@@ -333,10 +450,10 @@ class MoveJoints(HelloNode):
         command.linear.x = 0.0
         self.vel_pub.publish(command)
 
-    def send_command(self, position, link_name: String):
+    def send_command(self, position, link_name: String, timeout_sec=2.0):
         while not self.joint_state.position:
             self.get_logger().info('Waiting for joint state msg to arrive')
-            continue
+            time.sleep(0.05)
 
         self.get_logger().info(f'Moving {link_name}')
 
@@ -349,8 +466,31 @@ class MoveJoints(HelloNode):
         trajectory_goal.trajectory.points = [point]
         trajectory_goal.trajectory.header.frame_id = 'base_link'
 
-        self.trajectory_client.send_goal_async(trajectory_goal)
+        goal_future = self.trajectory_client.send_goal_async(trajectory_goal)
         self.get_logger().info('Goal Sent')
+
+        start = self.get_clock().now()
+        while not goal_future.done():
+            time.sleep(0.05)
+            if (self.get_clock().now() - start).nanoseconds / 1e9 > timeout_sec:
+                self.get_logger().warn(f'Goal send timed out for {link_name}')
+                return False
+            
+        goal_handle = goal_future.result()
+        if goal_handle is None or not goal_handle.accepted:
+            self.get_logger().warn(f'Goal for {link_name} was rejected')
+            return False
+        
+        result_future = goal_handle.get_result_async()
+        start = self.get_clock().now()
+        while not result_future.done():
+            time.sleep(0.05)
+            if (self.get_clock().now() - start).nanoseconds / 1e9 > timeout_sec:
+                self.get_logger().warn(f'{link_name} move timed out')
+                return False
+
+        self.get_logger().info(f'{link_name} move complete')
+        return True
 
 def main(args=None):
     node = MoveJoints()
