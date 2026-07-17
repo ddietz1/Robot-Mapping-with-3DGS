@@ -22,6 +22,9 @@ from cv_bridge import CvBridge
 import cv2
 import numpy as np
 
+from nav2_msgs.action import ComputeAndTrackRoute, ComputeRoute, FollowPath
+from rclpy.action import ActionClient
+
 class MoveJoints(HelloNode):
 
     def __init__(self):
@@ -46,11 +49,14 @@ class MoveJoints(HelloNode):
             self.declare_parameter('d405_poses_yaw', [0.0])
         if not self.has_parameter('d405_poses_lift'):
             self.declare_parameter('d405_poses_lift', [0.4])
+        if not self.has_parameter('run_num'):
+            self.declare_parameter('run_num', 0)
 
         pans = self.get_parameter('d435_poses_pan').value
         self.get_logger().info(f'd435 pans are {pans}')
         tilts = self.get_parameter('d435_poses_tilt').value
         self.d435_poses = list(zip(pans, tilts))  # -> [(pan, tilt), ...]
+        self.get_logger().info(f'd435 poses are {self.d435_poses}')
 
         self.d405_tilts = self.get_parameter('d405_poses_tilt').value
         self.d405_yaws = self.get_parameter('d405_poses_yaw').value
@@ -58,13 +64,14 @@ class MoveJoints(HelloNode):
 
         self.waypoints = [self.get_parameter('stretch_waypoints').value]
         self.get_logger().info(f'waypoints are {self.waypoints}')
+        self.run = self.get_parameter('run_num').value
 
         # Declare Constants
         self.stretch_mode = None
         self.gripper_open = True
 
         # Variables for frame captures
-        self.capture_dir = os.path.expanduser('~/stretch_user/captures')
+        self.capture_dir = os.path.expanduser(f'~/stretch_user/captures/{self.run}')
         os.makedirs(self.capture_dir, exist_ok=True)
 
         self.bridge = CvBridge()
@@ -76,6 +83,18 @@ class MoveJoints(HelloNode):
 
         # Declare global vars
         self.navigator = BasicNavigator()
+
+        self.route_client = ActionClient(
+            self,
+            ComputeRoute,
+            'compute_route'
+        )
+
+        self.path_client = ActionClient(
+            self,
+            FollowPath,
+            'follow_path'
+        )
 
         # Set initial pose for the bot
         initial_pose = PoseStamped()
@@ -101,6 +120,12 @@ class MoveJoints(HelloNode):
 
         self.set_pos_mode_srv = self.create_service(
             Trigger, 'set_position_mode', self.handle_set_position_mode)
+        
+        self.route_srv = self.create_service(
+            Trigger,
+            'follow_route',
+            self.follow_route_cb
+        )
 
         # Create Clients
 
@@ -206,9 +231,6 @@ class MoveJoints(HelloNode):
             self.get_logger().warn(f'Mode switch service reported failure for {mode}')
             return False
         
-        # The service call succeeding means the driver accepted the request,
-        # but self.mode only updates once /stretch/mode publishes the change.
-        # Wait for that so callers can trust self.mode immediately after this returns.
         start = self.get_clock().now()
         while self.stretch_mode != mode:
             time.sleep(0.05)
@@ -222,6 +244,13 @@ class MoveJoints(HelloNode):
         return True
 
     # --- Service callbacks ---
+    def follow_route_cb(self, request, response):
+        """Service call to trigger the robot to follow a defined route."""
+        threading.Thread(target=self.follow_route, args=([5, 6, 1, 2, 3],), kwargs={'loops': 1}, daemon=True).start()
+        self.get_logger().info('Route following started in background')
+        response.success = True
+        return response
+
     def handle_set_navigation_mode(self, request, response):
         success = self.switch_mode(self.nav_mode_client, 'navigation')
         response.success = success
@@ -258,6 +287,7 @@ class MoveJoints(HelloNode):
             
             self._d405_captured_frame = (rgb_msg, depth_msg, info_msg)
             self._d405_capture_requested = False
+
     # --- Helper functions ---
     def wait_until_settled(self, joint_names, vel_thresh=0.01, timeout_sec=2.0):
         """Block frame capture until joint vels fall below threshold."""
@@ -284,6 +314,7 @@ class MoveJoints(HelloNode):
         flag_attr = f'_{camera}_capture_requested'
         frame_attr = f'_{camera}_captured_frame'
 
+        request = self.get_clock().now()
         with self._capture_lock:
             setattr(self, frame_attr, None)
             setattr(self, flag_attr, True)
@@ -292,7 +323,16 @@ class MoveJoints(HelloNode):
             with self._capture_lock:
                 frame = getattr(self, frame_attr)
             if frame is not None:
-                break
+                rgb_msg, depth_msg, info_msg = frame
+                stamp = rgb_msg.header.stamp
+                frame_time = rclpy.time.Time.from_msg(stamp)
+                if frame_time > request:
+                    break  # genuinely fresh, accept it
+                else:
+                    # stale match slipped through; discard and keep waiting
+                    with self._capture_lock:
+                        setattr(self, frame_attr, None)
+                        setattr(self, flag_attr, True)
             time.sleep(0.05)
             elapsed = (self.get_clock().now() - start).nanoseconds / 1e9
             if elapsed > timeout_sec:
@@ -314,6 +354,129 @@ class MoveJoints(HelloNode):
 
 
     # --- Control functions ---
+
+    def compute_path(self, start_id, goal_id, use_start=True, timeout_sec=60.0):
+        """Command the robot to move between two nodes defined in the route geojson file."""
+
+        if not self.route_client.wait_for_server(timeout_sec=5.0):
+            self.get_logger().warn('compute_and_track_route action server not available')
+            return False
+        
+        goal_msg = ComputeRoute.Goal()
+        goal_msg.use_poses = False
+        goal_msg.use_start = use_start
+        goal_msg.start_id = start_id
+        goal_msg.goal_id = goal_id
+
+        self.get_logger().info(f'Requesting route between {start_id} and {goal_id}')
+        goal_future = self.route_client.send_goal_async(
+            goal=goal_msg
+        )
+
+        start = self.get_clock().now()
+        while not goal_future.done():
+            time.sleep(0.05)
+            if (self.get_clock().now() - start).nanoseconds / 1e9 > timeout_sec:
+                self.get_logger().warn(f'Route goal send timed out ({start_id}->{goal_id})')
+                return False
+            
+        goal_handle = goal_future.result()
+        if goal_handle is None or not goal_handle.accepted:
+            self.get_logger().warn(f'Route goal rejected ({start_id}->{goal_id})')
+            return False
+        
+        result_future = goal_handle.get_result_async()
+        start = self.get_clock().now()
+        while not result_future.done():
+            time.sleep(0.05)
+            if (self.get_clock().now() - start).nanoseconds / 1e9 > timeout_sec:
+                self.get_logger().warn(f'Route execution timed out ({start_id}->{goal_id})')
+                return False
+
+        result_wrapper = result_future.result()
+        status = result_wrapper.status
+        result = result_wrapper.result
+
+        self.get_logger().info(f'compute_route finished with status: {status}')
+        self.get_logger().info(f'Path has {len(result.path.poses)} poses')
+
+        if len(result.path.poses) == 0:
+            self.get_logger().error('Computed path is empty!')
+            return None
+
+        return result.path
+    
+    def route_cb(self, feedback_msg):
+        fb = feedback_msg.feedback
+        self.get_logger().info(
+            f'Route progress: last_node={fb.last_node_id}, next_node={fb.next_node_id}'
+        )
+
+    def path_feedback_cb(self, feedback_msg):
+        fb = feedback_msg.feedback
+        self.get_logger().info(
+            f'FollowPath feedback: distance_to_goal={fb.distance_to_goal:.3f}, '
+            f'speed={fb.speed:.3f}'
+        )
+
+    def follow_route(self, nodes, loops=1):
+        """Follow a route sequence. """
+
+        self.switch_mode(self.nav_mode_client, 'navigation')
+
+        first_leg = True
+        for _ in range(loops):
+            for start_id, goal_id in zip(nodes[:-1], nodes[1:]):
+                use_start = not first_leg
+                path = self.compute_path(start_id, goal_id, use_start=use_start)
+                first_leg = False
+                if path is None:
+                    self.get_logger().warn(f'Failed to find a valid path')
+                    return
+                success = self.follow_path(path)
+                if success:
+                    self.get_logger().info('SUCCESS: robot followed the path!')
+                else:
+                    self.get_logger().error('FollowPath did not succeed')
+                
+    def follow_path(self, path, timeout_sec=60.0):
+        """Commands the robot to follow a Path object. """
+
+        goal_msg = FollowPath.Goal()
+        goal_msg.path = path
+        goal_msg.controller_id = ''
+        goal_msg.goal_checker_id = ''
+
+        self.get_logger().info(f'Sending goal with {len(path.poses)} poses')
+        goal_future = self.path_client.send_goal_async(
+            goal_msg, feedback_callback=self.path_feedback_cb
+        )
+        start = self.get_clock().now()
+        while not goal_future.done():
+            time.sleep(0.05)
+            elapsed = (self.get_clock().now() - start).nanoseconds / 1e9
+            if elapsed > timeout_sec:
+                self.get_logger().error('Timed out sending follow_path goal')
+                return False
+            
+        goal_handle = goal_future.result()
+        if goal_handle is None or not goal_handle.accepted:
+            self.get_logger().error('follow_path goal was rejected')
+            return False
+        
+        result_future = goal_handle.get_result_async()
+        start = self.get_clock().now()
+        while not result_future.done():
+            time.sleep(0.05)
+            elapsed = (self.get_clock().now() - start).nanoseconds / 1e9
+            if elapsed > timeout_sec:
+                self.get_logger().error('Timed out waiting for follow_path result')
+                return False
+
+        result_wrapper = result_future.result()
+        self.get_logger().info(f'follow_path finished with status: {result_wrapper.status}')
+        return result_wrapper.status == 4  # GoalStatus.STATUS_SUCCEEDED
+        
     def follow_waypoints(self):
         """Sends the hello robot to a given list of points."""
 
@@ -341,12 +504,12 @@ class MoveJoints(HelloNode):
 
             time.sleep(0.5)
 
-
             # Now we need to move the camera around to get different views
             # first capture larger images with the d435
             for idx, cp in enumerate(self.d435_poses):
                 self.camera_capture_pose(cp)
-                self.wait_until_settled(['joint_head_pan', 'joint_head_tilt'])
+                self.wait_until_settled(['joint_head_pan', 'joint_head_tilt'], vel_thresh=.005)
+                time.sleep(0.5)
                 pose_name = f'wp{wp_idx}_d435_pose{idx}'
                 self.capture_frame(pose_name, camera='d435')
 
@@ -374,18 +537,7 @@ class MoveJoints(HelloNode):
                         pose_name = f'wp{wp_idx}_d405_pose{idx}_yaw_{yaw_idx}_pitch_{p_idx}'
                         self.capture_frame(pose_name, camera='d405')
 
-            # self.send_command(0.6, 'joint_lift')
-            # self.wait_until_settled(['joint_lift'])
-            # pose_name = f'wp_d405_pose1'
-            # self.capture_frame(pose_name, camera='d405')
-            # self.send_command(0.3, 'joint_lift')
-            # pose_name = f'wp_d405_pose2'
-            # self.capture_frame(pose_name, camera='d405')
-            # self.send_command(0.3, 'joint_lift')
-
-            # Send arm out and wrist tilt to 0.0
-            # self.send_command(0.2, 'joint_arm_l1') # broken :(
-            # self.send_command(0.0, 'joint_wrist_pitch')
+        self.get_logger().info('Completed image captures!')
 
     def camera_capture_pose(self, pose, camera='d435', joint='joint_lift'):
         """Move the camera on the bot to a given pose."""
@@ -494,7 +646,7 @@ class MoveJoints(HelloNode):
 
 def main(args=None):
     node = MoveJoints()
-    node.follow_waypoints()
+    # node.follow_waypoints()
     node.new_thread.join()
     node.destroy_node()
     rclpy.shutdown()

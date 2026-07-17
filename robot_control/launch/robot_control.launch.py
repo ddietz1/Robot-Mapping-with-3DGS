@@ -12,7 +12,7 @@ def generate_launch_description():
     map_yamlPath = os.path.join(
         get_package_share_directory('robot_control'),
         'config/maps',
-        'MSR_lab.yaml'
+        'MSR_Zoo_2.yaml'
     )
     yamlPath = os.path.join(
         get_package_share_directory('robot_control'),
