@@ -14,16 +14,20 @@ from std_srvs.srv import Empty, Trigger
 from geometry_msgs.msg import Point, Pose, PoseStamped, Twist
 from robot_interfaces.srv import Camera
 from sensor_msgs.msg import Image, CameraInfo
-from math import atan2, sqrt, pi
+from math import atan2, sqrt, pi, sin, cos
 from copy import deepcopy
 import time, os, threading
 import message_filters
 from cv_bridge import CvBridge
 import cv2
 import numpy as np
+from scipy.spatial.transform import Rotation as R
 
 from nav2_msgs.action import ComputeAndTrackRoute, ComputeRoute, FollowPath
 from rclpy.action import ActionClient
+
+from tf2_ros import Buffer, TransformListener
+from tf2_geometry_msgs import do_transform_pose
 
 class MoveJoints(HelloNode):
 
@@ -37,8 +41,12 @@ class MoveJoints(HelloNode):
         )
 
         # Declare Parameters
-        if not self.has_parameter('stretch_waypoints'):
-            self.declare_parameter('stretch_waypoints', [0.0, 0.0])
+        if not self.has_parameter('waypoints_x'):
+            self.declare_parameter('waypoints_x', [0.0])
+        if not self.has_parameter('waypoints_y'):
+            self.declare_parameter('waypoints_y', [0.0])
+        if not self.has_parameter('waypoints_yaw'):
+            self.declare_parameter('waypoints_yaw', [0.0])
         if not self.has_parameter('d435_poses_pan'):
             self.declare_parameter('d435_poses_pan', [0.0])
         if not self.has_parameter('d435_poses_tilt'):
@@ -62,9 +70,13 @@ class MoveJoints(HelloNode):
         self.d405_yaws = self.get_parameter('d405_poses_yaw').value
         self.d405_lifts = self.get_parameter('d405_poses_lift').value
 
-        self.waypoints = [self.get_parameter('stretch_waypoints').value]
+        xs = self.get_parameter('waypoints_x').value
+        ys = self.get_parameter('waypoints_y').value
+        yaws = self.get_parameter('waypoints_yaw').value
+        self.waypoints = list(zip(xs, ys, yaws))  # -> [(x, y, yaw), ...]
         self.get_logger().info(f'waypoints are {self.waypoints}')
-        self.run = self.get_parameter('run_num').value
+
+        self.run = self.get_parameter('run_num')
 
         # Declare Constants
         self.stretch_mode = None
@@ -84,6 +96,9 @@ class MoveJoints(HelloNode):
         # Declare global vars
         self.navigator = BasicNavigator()
 
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+
         self.route_client = ActionClient(
             self,
             ComputeRoute,
@@ -100,7 +115,7 @@ class MoveJoints(HelloNode):
         initial_pose = PoseStamped()
         initial_pose.header.frame_id = 'map'
         initial_pose.header.stamp = self.navigator.get_clock().now().to_msg()
-        initial_pose.pose.position.x = 0.0
+        initial_pose.pose.position.x = -1.0
         initial_pose.pose.position.y = 0.0
         initial_pose.pose.orientation.z = 0.0
         initial_pose.pose.orientation.w = 1.0
@@ -125,6 +140,12 @@ class MoveJoints(HelloNode):
             Trigger,
             'follow_route',
             self.follow_route_cb
+        )
+
+        self.test_IK = self.create_service(
+            Trigger,
+            'test_ik',
+            self.test_pan_tilt_cb
         )
 
         # Create Clients
@@ -205,6 +226,33 @@ class MoveJoints(HelloNode):
         self.gripper_ts.registerCallback(self.gripper_synced_frame_cb)
 
 
+    # --- Testing Functions ---
+    def test_pan_tilt_cb(self, request, response):
+        """Temporary test service, hardcoded target pose for validation."""
+        test_pose = PoseStamped()
+        test_pose.header.frame_id = 'map'
+        test_pose.header.stamp = self.get_clock().now().to_msg()
+        test_pose.pose.position.x = 0.5  # adjust based on robot's actual current map position
+        test_pose.pose.position.y = 1.5
+        test_pose.pose.position.z = 0.6  # roughly camera height
+        test_pose.pose.orientation.w = 1.0
+
+        pitch, yaw, lift = self.compute_d405_rpy(test_pose)
+        lift_request = Camera.Request()
+        lift_response = Camera.Response()
+        lift_request.angles = [lift, yaw]
+        rpy_request = Camera.Request()
+        rpy_request.angles = [pitch, yaw]
+        rpy_response = Camera.Response()
+
+        
+        # self.move_camera(request=request, response=cam_response, camera='d405', joint='link_wrist_pitch')
+        self.move_d405_lift(request=lift_request, response=lift_response)
+        self.get_logger().info(f'Computed lift:{lift}')
+        self.move_d405_pitch_yaw(request=rpy_request, response=rpy_response)
+        self.get_logger().info(f'Computed pitch:{pitch}, yaw: {yaw}')
+        response.success = True
+        return response
     # --- Client callbacks ---
     def switch_mode(self, client, mode, timeout_sec=2.0):
         """Calls the drivers mode change service."""
@@ -246,7 +294,7 @@ class MoveJoints(HelloNode):
     # --- Service callbacks ---
     def follow_route_cb(self, request, response):
         """Service call to trigger the robot to follow a defined route."""
-        threading.Thread(target=self.follow_route, args=([5, 6, 1, 2, 3],), kwargs={'loops': 1}, daemon=True).start()
+        threading.Thread(target=self.follow_route, args=([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],), kwargs={'loops': 1}, daemon=True).start()
         self.get_logger().info('Route following started in background')
         response.success = True
         return response
@@ -352,6 +400,76 @@ class MoveJoints(HelloNode):
         self.get_logger().info(f'Saved capture: {rgb_path}, {depth_path}')
         return rgb_img, depth_img
 
+
+    def compute_standoff_dist(self, pose: PoseStamped, standoff_dist=0.5):
+        """Computes where the robot should go given a pose.
+        
+        Computes the x, y position to send the base of the robot to
+        given the map frame pose."""
+
+        x =  pose.pose.position.x
+        y =  pose.pose.position.y
+        z =  pose.pose.position.z
+        qx = pose.pose.orientation.x
+        qy = pose.pose.orientation.y
+        qz = pose.pose.orientation.z
+        qw = pose.pose.orientation.w
+        
+        # Grab base yaw
+        base_yaw = atan2(y, x) # radians
+        # Grab rpy for camera from quaternion
+        r = R.from_quat([qx, qy, qz, qw])
+        roll, pitch, yaw = r.as_euler('xyz', degrees = False)
+
+        return (x, y, z, roll, pitch, yaw)
+
+
+    def compute_d435_pan_tilt(self, target_pose):
+        """Transform target pose from map frame into the d435 cameras
+        
+        mount frame, then compute pan/tilt."""
+
+        self.move_to_pose({'joint_head_pan': 0.0, 'joint_head_tilt': 0.0}, blocking=True)
+        self.wait_until_settled(['joint_head_pan', 'joint_head_tilt'])
+
+        target_in_cam_frame = self.transform_pose(target_pose, 'camera_link')
+        x, y, z = target_in_cam_frame.position.x, target_in_cam_frame.position.y, target_in_cam_frame.position.z
+        pan = atan2(y, x)
+        tilt = atan2(z, sqrt(x**2 + y**2))
+        print(f'tilt: {tilt}, pan:{pan}')
+        return pan, tilt
+    
+    def compute_d405_rpy(self, target_pose):
+        """Same as previous function but for the gripper camera."""
+
+        self.move_to_pose({'joint_head_pan': 0.0, 'joint_head_tilt': 0.0}, blocking=True)
+        self.wait_until_settled(['joint_head_pan', 'joint_head_tilt'])
+
+        target_in_cam_frame = self.transform_pose(target_pose, 'link_gripper_s3_body')
+        x, y, z = target_in_cam_frame.position.x, target_in_cam_frame.position.y, target_in_cam_frame.position.z
+        print(f'transformed x:{x}, y:{y}, z:{z}')
+
+        yaw = atan2(y, x)
+        pitch = atan2(z, sqrt(x**2 + y**2))
+        lift = z
+        print(f'yaw: {yaw}, pitch: {pitch}')
+        return pitch, yaw, lift
+    
+    def transform_pose(self, pose_stamped, target_frame, timeout_sec = 2.0):
+        """Transform a PoseStamped into a given frame."""
+
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                target_frame,
+                pose_stamped.header.frame_id,
+                rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=timeout_sec)
+            )
+            transformed = do_transform_pose(pose_stamped.pose, transform)
+            return transformed
+        except Exception as e:
+            self.get_logger().warn(f'TF transform failed: {e}')
+            return None
 
     # --- Control functions ---
 
@@ -481,16 +599,19 @@ class MoveJoints(HelloNode):
         """Sends the hello robot to a given list of points."""
 
         # switch to navigation mode 
-        self.switch_mode(self.nav_mode_client, 'navigation')
+        # self.switch_mode(self.nav_mode_client, 'navigation')
 
         pose = PoseStamped()
         pose.header.frame_id = 'map'
         pose.pose.orientation.w = 1.0
 
         # move through all poses in the waypoints array
-        for wp_idx, pt in enumerate(self.waypoints):
-            pose.pose.position.x = pt[0]
-            pose.pose.position.y = pt[1]
+        for wp_idx, (x, y, yaw) in enumerate(self.waypoints):
+            self.switch_mode(self.nav_mode_client, 'navigation')
+            pose.pose.position.x = x
+            pose.pose.position.y = y
+            pose.pose.orientation.z = sin(yaw / 2.0)
+            pose.pose.orientation.w = cos(yaw / 2.0)
             pose.header.stamp = self.navigator.get_clock().now().to_msg()
 
             # move to the first pose
@@ -517,25 +638,26 @@ class MoveJoints(HelloNode):
             # capture smaller images with the d405
 
             # Send lift to various positions
-            for idx, cp in enumerate(self.d405_lifts):
-                self.camera_capture_pose(cp, camera='d405', joint='joint_lift')
-                self.wait_until_settled(['joint_lift'])
-                pose_name = f'wp{wp_idx}_d405_pose{idx}'
-                self.capture_frame(pose_name, camera='d405')
+            # make an if statement here to determine if d405 is used
+            # for idx, cp in enumerate(self.d405_lifts):
+            #     self.camera_capture_pose(cp, camera='d405', joint='joint_lift')
+            #     self.wait_until_settled(['joint_lift'])
+            #     pose_name = f'wp{wp_idx}_d405_pose{idx}'
+            #     self.capture_frame(pose_name, camera='d405')
 
-                # Within each lift position, yaw and pitch the gripper
-                for yaw_idx, yaw_pose in enumerate(self.d405_yaws):
-                    self.camera_capture_pose(yaw_pose, camera='d405', joint='joint_wrist_yaw')
-                    self.wait_until_settled((['joint_wrist_yaw']))
-                    pose_name = f'wp{wp_idx}_d405_pose{idx}_yaw_{yaw_idx}'
-                    self.capture_frame(pose_name, camera='d405')
+            #     # Within each lift position, yaw and pitch the gripper
+            #     for yaw_idx, yaw_pose in enumerate(self.d405_yaws):
+            #         self.camera_capture_pose(yaw_pose, camera='d405', joint='joint_wrist_yaw')
+            #         self.wait_until_settled((['joint_wrist_yaw']))
+            #         pose_name = f'wp{wp_idx}_d405_pose{idx}_yaw_{yaw_idx}'
+            #         self.capture_frame(pose_name, camera='d405')
 
-                    # Within each yaw, pitch the gripper 
-                    for p_idx, p_pose, in enumerate(self.d405_tilts):
-                        self.camera_capture_pose(p_pose, camera='d405', joint='joint_wrist_pitch')
-                        self.wait_until_settled((['joint_wrist_pitch']))
-                        pose_name = f'wp{wp_idx}_d405_pose{idx}_yaw_{yaw_idx}_pitch_{p_idx}'
-                        self.capture_frame(pose_name, camera='d405')
+            #         # Within each yaw, pitch the gripper 
+            #         for p_idx, p_pose, in enumerate(self.d405_tilts):
+            #             self.camera_capture_pose(p_pose, camera='d405', joint='joint_wrist_pitch')
+            #             self.wait_until_settled((['joint_wrist_pitch']))
+            #             pose_name = f'wp{wp_idx}_d405_pose{idx}_yaw_{yaw_idx}_pitch_{p_idx}'
+            #             self.capture_frame(pose_name, camera='d405')
 
         self.get_logger().info('Completed image captures!')
 
@@ -576,12 +698,52 @@ class MoveJoints(HelloNode):
             )
             self.get_logger().info(f'Moving camera to {pan}, {tilt}')
 
-        elif camera=='d405':
-            self.move_to_pose(
-                {joint: pan},
-                blocking=True
-            )
-            self.get_logger().info(f'Moving gripper camera joint: {joint} to {pan}')
+        # elif camera=='d405' and joint=='joint_lift':
+        #     self.move_to_pose(
+        #         {joint: pan},
+        #         blocking=True
+        #     )
+        #     self.get_logger().info(f'Moving gripper camera joint: {joint} to {pan}')
+
+        # elif camera=='d405' and joint!='joint_lift':
+        #     tilt = joint_positions[1]
+        #     self.move_to_pose(
+        #         {'joint_wrist_yaw': pan, 'joint_wrist_pitch': tilt},
+        #         blocking=True
+        #     )
+        return response
+    
+    def move_d405_lift(self, request, response):
+        """Adjust the lift height for the gripper mounted camera."""
+
+        # before moving joints, switch to position mode
+        if self.stretch_mode != 'position':
+            self.switch_mode(self.pos_mode_client, 'position')
+
+        joint_positions = [float(x) for x in request.angles]
+        lift = joint_positions[0]
+        self.move_to_pose(
+            {'jount_lift': lift},
+            blocking=True
+        )
+        self.get_logger().info(f'Moving lift to {lift}')
+        return response
+
+    def move_d405_pitch_yaw(self, request, response):
+        """Adjust the pitch and yaw of the gripper mount."""
+
+        # before moving joints, switch to position mode
+        if self.stretch_mode != 'position':
+            self.switch_mode(self.pos_mode_client, 'position')
+
+        joint_positions = [float(x) for x in request.angles]
+        pitch = joint_positions[0]
+        yaw = joint_positions[1]
+        self.move_to_pose(
+            {'joint_wrist_yaw': yaw, 'joint_wrist_pitch': pitch},
+            blocking=True
+        )
+        self.get_logger().info(f'Moving pitch to {pitch}, moving yaw to {yaw}')
         return response
 
     def drive_robot(self, speed=0.1, duration=2.0):
