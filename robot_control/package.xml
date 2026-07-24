@@ -12,6 +12,7 @@
   <depend>trajectory_msgs</depend>
   <depend>std_msgs</depend>
   <depend>geometry_msgs</depend>
+  <depend>visualization_msgs</depend>
   <depend>hello_helpers</depend>
 
   <build_depend>robot_interfaces</build_depend>

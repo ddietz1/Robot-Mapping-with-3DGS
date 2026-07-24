@@ -20,6 +20,12 @@ def generate_launch_description():
         'parameters.yaml'
     )
 
+    JointsPath = os.path.join(
+        get_package_share_directory('robot_control'),
+        'config',
+        'robot_joints.yaml'
+    )
+
     camera_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(os.path.join(
             get_package_share_directory('stretch_core'),
@@ -42,6 +48,13 @@ def generate_launch_description():
         parameters=[yamlPath]
     )
 
+    candidate_generation_node = Node(
+        package='candidate_generation',
+        executable='generate_candidates',
+        name='generate_candidates',
+        output='screen'
+    )
+
     return LaunchDescription([
         DeclareLaunchArgument(
             'map',
@@ -52,4 +65,5 @@ def generate_launch_description():
         nav2_launch,
         camera_launch,
         move_joints_node,
+        candidate_generation_node
     ])

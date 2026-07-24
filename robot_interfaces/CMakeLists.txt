@@ -8,12 +8,16 @@ endif()
 # find dependencies
 find_package(ament_cmake REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
+find_package(geometry_msgs REQUIRED)
 # uncomment the following section in order to fill in
 # further dependencies manually.
 # find_package(<dependency> REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/Camera.srv"
+  "srv/TestPoses.srv"
+  DEPENDENCIES
+  geometry_msgs
 )
 
 if(BUILD_TESTING)
